@@ -10,6 +10,10 @@ services:
       sizeGB: 1
     healthCheckPath: /api/health
     envVars:
+      - key: TRUSTPAY_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "true"
       - key: PAYPAL_CLIENT_ID
         sync: false
       - key: PAYPAL_CLIENT_SECRET
@@ -33,4 +37,8 @@ services:
       - key: VITE_AG_STUDIO_LICENSE_KEY
         sync: false
       - key: FRONTEND_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: ALLOWED_HOSTS
         sync: false

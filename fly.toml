@@ -1,0 +1,47 @@
+# TrustPay AI — Fly.io single-service deploy (UI + API from root Dockerfile).
+# Free-trial friendly: no [mounts] (volumes need a payment method). SQLite lives on
+# ephemeral container disk via TRUSTPAY_DB. Add a Fly volume later when you have a card.
+# Rename `app` to match the app you create in the Fly dashboard (or via `fly apps create`).
+# Secrets stay out of this file — set them with `fly secrets set` / the dashboard.
+
+app = "trustpay-ai"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  # Must match Dockerfile ENV PORT, start.sh default, EXPOSE, and http_service.internal_port.
+  PORT = "8080"
+  TRUSTPAY_ENV = "production"
+  TRUST_PROXY = "true"
+  # Ephemeral path for free trial (no volume). Override to /data/trustpay.db after mounting a volume.
+  TRUSTPAY_DB = "/tmp/trustpay.db"
+  # Post-deploy: set PUBLIC_BASE_URL, FRONTEND_URL (and ALLOWED_ORIGINS for Path B) via secrets/env.
+  # Same-origin Path A: PUBLIC_BASE_URL and FRONTEND_URL = https://<app>.fly.dev
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # Free tier: keep at most one Machine; 0 allows stop-when-idle.
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 80
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "45s"
+    method = "GET"
+    path = "/api/health"
+
+# Single small Machine (do not set a second region / HA count on free trial).
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpus = 1

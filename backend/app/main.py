@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 from collections import defaultdict, deque
 from typing import Optional
@@ -21,8 +22,10 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, ValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .sponsors import sponsor_router
 from .agents import assess
@@ -33,6 +36,27 @@ from .models import CheckoutOptions, Assessment, Decision, Listing, RiskLevel, U
 from .paypal import PayPalClient, PayPalError, localized_approval_url
 
 log = logging.getLogger("trustpay")
+
+CORS_METHODS = ("GET", "POST", "OPTIONS")
+CORS_HEADERS = ("Authorization", "Content-Type", "X-API-Key")
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Baseline browser hardening headers for API and optional static UI."""
+
+    def __init__(self, app, *, is_production: bool):
+        super().__init__(app)
+        self.is_production = is_production
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        if self.is_production:
+            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        return response
 
 OVERRIDABLE = {
     "title", "description", "category", "price", "currency", "return_policy", "shipping_days",
@@ -76,21 +100,54 @@ def create_app(settings: Optional[Settings] = None, paypal_transport: Optional[h
     store = Store(settings.db_path)
     paypal = PayPalClient(settings, transport=paypal_transport)
 
-    app = FastAPI(title="TrustPay AI", version="2.0.0", description="Pre-payment risk review with a human approval gate and PayPal checkout.")
+    docs = "/docs" if settings.docs_enabled else None
+    app = FastAPI(
+        title="TrustPay AI",
+        version="2.0.0",
+        description="Pre-payment risk review with a human approval gate and PayPal checkout.",
+        docs_url=docs,
+        redoc_url="/redoc" if settings.docs_enabled else None,
+        openapi_url="/openapi.json" if settings.docs_enabled else None,
+    )
     app.state.settings, app.state.store, app.state.paypal = settings, store, paypal
+    app.add_middleware(SecurityHeadersMiddleware, is_production=settings.is_production)
+    if settings.allowed_hosts:
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.allowed_hosts))
     if settings.allowed_origins:
-        app.add_middleware(CORSMiddleware, allow_origins=list(settings.allowed_origins), allow_methods=["*"], allow_headers=["*"])
+        # Explicit methods/headers only — avoid wildcard CORS in browser clients.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.allowed_origins),
+            allow_methods=list(CORS_METHODS),
+            allow_headers=list(CORS_HEADERS),
+            allow_credentials=False,
+            max_age=600,
+        )
 
     limiter = RateLimiter(settings.rate_limit_per_min)
 
+    def api_key_ok(provided: Optional[str]) -> bool:
+        expected = settings.api_key
+        if not expected:
+            return True
+        if not provided:
+            return False
+        # compare_digest requires equal-length strings; pad via secrets only when lengths match.
+        return secrets.compare_digest(provided, expected) if len(provided) == len(expected) else False
+
     async def require_api_key(x_api_key: Optional[str] = Header(None)) -> None:
-        if settings.api_key and x_api_key != settings.api_key:
+        if settings.api_key and not api_key_ok(x_api_key):
             raise HTTPException(401, "Invalid or missing X-API-Key")
 
     async def rate_limit(request: Request) -> None:
         # Each analysis makes several LLM calls, so these routes are throttled per client.
-        forwarded = request.headers.get("x-forwarded-for", "")
-        limiter.check(forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown"))
+        # Only trust X-Forwarded-For when the edge proxy is known (TRUST_PROXY=true).
+        if settings.trust_proxy:
+            forwarded = request.headers.get("x-forwarded-for", "")
+            client_key = forwarded.split(",")[0].strip() or (request.client.host if request.client else "unknown")
+        else:
+            client_key = request.client.host if request.client else "unknown"
+        limiter.check(client_key)
 
     def finish(a: Optional[Assessment], status: str, **extra) -> object:
         """Where the buyer's browser lands after PayPal: the frontend if configured, else JSON."""
@@ -102,10 +159,11 @@ def create_app(settings: Optional[Settings] = None, paypal_transport: Optional[h
 
     @app.exception_handler(PayPalError)
     async def paypal_error_handler(_: Request, exc: PayPalError):
-        return JSONResponse(
-            status_code=502,
-            content={"detail": str(exc), "paypal_status": exc.status, "debug_id": exc.debug_id, "paypal_details": exc.details},
-        )
+        content = {"detail": "PayPal request failed", "paypal_status": exc.status, "debug_id": exc.debug_id}
+        if not settings.is_production:
+            content["detail"] = str(exc)
+            content["paypal_details"] = exc.details
+        return JSONResponse(status_code=502, content=content)
 
     def get_or_404(assessment_id: str) -> Assessment:
         a = store.get(assessment_id)
@@ -139,16 +197,26 @@ def create_app(settings: Optional[Settings] = None, paypal_transport: Optional[h
 
     # ---------------------------------------------------------------- health
     @app.get("/api/health")
-    async def health(deep: bool = False):
-        body = {"status": "ok", "paypal_env": settings.paypal_env, "llm": f"{settings.llm_provider}:{settings.llm_model}",
-                "webhooks": bool(settings.paypal_webhook_id)}
+    async def health(deep: bool = False, x_api_key: Optional[str] = Header(None)):
+        body = {
+            "status": "ok",
+            "paypal_env": settings.paypal_env,
+            "llm": f"{settings.llm_provider}:{settings.llm_model}",
+            "webhooks": bool(settings.paypal_webhook_id),
+            "env": settings.trustpay_env,
+        }
         if deep:
+            # Deep checks probe PayPal with server credentials — require the access key when configured.
+            if settings.api_key and not api_key_ok(x_api_key):
+                raise HTTPException(401, "Invalid or missing X-API-Key")
             try:
                 await paypal.verify_credentials()
                 body["paypal_auth"] = "ok"
             except PayPalError as exc:
-                body["paypal_auth"] = f"failed: {exc}"
+                body["paypal_auth"] = "failed"
                 body["status"] = "degraded"
+                if not settings.is_production:
+                    body["paypal_auth_detail"] = str(exc)
         return body
 
     @app.get("/api/config")

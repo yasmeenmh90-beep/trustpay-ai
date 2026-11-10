@@ -53,16 +53,22 @@ class Settings:
     channel3_base_url: str = "https://api.trychannel3.com/v1"
 
     db_path: str = "trustpay.db"
-    api_key: str = ""  # optional: require X-API-Key on /api routes
+    api_key: str = ""  # required when TRUSTPAY_ENV=production; require X-API-Key on /api routes
     allowed_origins: tuple[str, ...] = ()
+    allowed_hosts: tuple[str, ...] = ()  # optional Host header allow-list (TrustedHostMiddleware)
     frontend_url: str = ""  # if set, PayPal return/cancel redirect the buyer here instead of returning JSON
     rate_limit_per_min: int = 20  # per client IP on /api/analyze*; 0 disables
+    trustpay_env: str = "development"  # development | production
+    trust_proxy: bool = False  # when True, use first X-Forwarded-For hop for rate limits
+    enable_docs: bool | None = None  # None = auto (off in production); True/False overrides
 
     @classmethod
     def from_env(cls) -> "Settings":
         provider = os.getenv("LLM_PROVIDER", "anthropic").lower()
         key = os.getenv("ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY", "")
         default_model = "claude-sonnet-5-5" if provider == "anthropic" else "gpt-4o-mini"
+        docs_raw = os.getenv("TRUSTPAY_ENABLE_DOCS", "").strip().lower()
+        enable_docs = None if docs_raw == "" else docs_raw in ("1", "true", "yes", "on")
         return cls(
             paypal_client_id=os.getenv("PAYPAL_CLIENT_ID", ""),
             paypal_client_secret=os.getenv("PAYPAL_CLIENT_SECRET", ""),
@@ -81,12 +87,28 @@ class Settings:
             db_path=os.getenv("TRUSTPAY_DB", "trustpay.db"),
             api_key=os.getenv("TRUSTPAY_API_KEY", ""),
             allowed_origins=tuple(o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()),
+            allowed_hosts=tuple(h.strip() for h in os.getenv("ALLOWED_HOSTS", "").split(",") if h.strip()),
             frontend_url=os.getenv("FRONTEND_URL", "").rstrip("/"),
             rate_limit_per_min=int(os.getenv("RATE_LIMIT_PER_MIN", "20")),
+            trustpay_env=os.getenv("TRUSTPAY_ENV", "development").strip().lower() or "development",
+            trust_proxy=os.getenv("TRUST_PROXY", "").strip().lower() in ("1", "true", "yes", "on"),
+            enable_docs=enable_docs,
         )
+
+    @property
+    def is_production(self) -> bool:
+        return self.trustpay_env == "production"
+
+    @property
+    def docs_enabled(self) -> bool:
+        if self.enable_docs is not None:
+            return self.enable_docs
+        return not self.is_production
 
     def validate(self) -> None:
         missing = []
+        if self.trustpay_env not in ("development", "production"):
+            raise ConfigError("TRUSTPAY_ENV must be 'development' or 'production'")
         if self.paypal_locale not in ("en-US", "ar-AE", "fr-FR"):
             raise ConfigError("PAYPAL_LOCALE must be en-US, ar-AE or fr-FR")
         if not self.paypal_client_id:
@@ -99,8 +121,24 @@ class Settings:
             raise ConfigError("LLM_PROVIDER must be 'anthropic' or 'openai'")
         if not self.llm_api_key:
             missing.append("ANTHROPIC_API_KEY" if self.llm_provider == "anthropic" else "OPENAI_API_KEY")
+        if self.is_production and not self.api_key:
+            missing.append("TRUSTPAY_API_KEY")
         if missing:
             raise ConfigError("Missing required environment variables: " + ", ".join(missing))
+        # Split UI (e.g. Vercel) needs CORS. Same-origin Docker/Fly (FRONTEND_URL == PUBLIC_BASE_URL) does not.
+        if (
+            self.is_production
+            and self.frontend_url
+            and not self.allowed_origins
+            and self.frontend_url.rstrip("/") != self.public_base_url.rstrip("/")
+        ):
+            raise ConfigError(
+                "Production with a separate FRONTEND_URL requires ALLOWED_ORIGINS "
+                "(comma-separated browser origins for the Vercel/frontend host). "
+                "Same-origin Fly/Docker can set FRONTEND_URL equal to PUBLIC_BASE_URL and leave ALLOWED_ORIGINS empty."
+            )
+        if self.is_production and "sandbox" not in self.paypal_base_url and not self.paypal_webhook_id:
+            raise ConfigError("Live PayPal requires PAYPAL_WEBHOOK_ID so capture events stay in sync")
 
     @property
     def paypal_env(self) -> str:

@@ -32,6 +32,47 @@ def test_refuses_to_start_without_credentials(tmp_path, missing):
         make_settings(tmp_path, **{missing: ""}).validate()
 
 
+def test_production_requires_api_key(tmp_path):
+    with pytest.raises(ConfigError, match="TRUSTPAY_API_KEY"):
+        make_settings(tmp_path, trustpay_env="production", api_key="").validate()
+
+
+def test_production_requires_cors_when_frontend_set(tmp_path):
+    with pytest.raises(ConfigError, match="ALLOWED_ORIGINS"):
+        make_settings(
+            tmp_path, trustpay_env="production", api_key="prod-key",
+            public_base_url="https://api.example.com",
+            frontend_url="https://app.example.com", allowed_origins=(),
+        ).validate()
+
+
+def test_production_same_origin_fly_skips_cors(tmp_path):
+    make_settings(
+        tmp_path, trustpay_env="production", api_key="prod-key",
+        public_base_url="https://trustpay-ai.fly.dev",
+        frontend_url="https://trustpay-ai.fly.dev", allowed_origins=(),
+    ).validate()
+
+
+def test_production_disables_openapi_docs(tmp_path, fake_paypal, llm_down):
+    import httpx
+    from fastapi.testclient import TestClient
+    from app.main import create_app
+
+    app = create_app(
+        make_settings(tmp_path, trustpay_env="production", api_key="prod-key",
+                      frontend_url="https://app.example.com",
+                      allowed_origins=("https://app.example.com",)),
+        paypal_transport=httpx.MockTransport(fake_paypal),
+    )
+    c = TestClient(app)
+    assert c.get("/docs").status_code == 404
+    assert c.get("/openapi.json").status_code == 404
+    assert c.get("/api/health").headers.get("x-content-type-options") == "nosniff"
+    assert c.get("/api/health?deep=true").status_code == 401
+    assert c.get("/api/health?deep=true", headers={"X-API-Key": "prod-key"}).status_code == 200
+
+
 def test_risk_tiers(client):
     assert analyze(client, CLEAN)["risk_level"] == "LOW"
     assert analyze(client, MEDIUM)["risk_level"] == "MEDIUM"
